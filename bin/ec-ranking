@@ -1,0 +1,394 @@
+#!/bin/sh
+#
+# EC ranking
+#
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+SCRIPT=$(basename $0)
+syntax() {
+cat <<EOF 
+Syntax: $SCRIPT {-a|-n|-o <AGE>} [-t <TAG>] {-m <STEP>|-r <STEP>|-f <ITER>}
+
+  Distributed, iterative PageRank algorithm implemented as map-reduce process.
+  Each iteration runs as a 'map' on urls given by user defined criteria.
+  The results are stored in ES and can be accessed with via 'reduce' option.
+
+Options:
+
+  -a      - Use any urls indexed in ES.
+  -n      - Use new urls that have not been crawled yet.
+  -o AGE  - Use urls crawled AGE ago, where AGE is in ES format (1s, 2m, ect.).
+  -t TAG  - Filter the urls by tag, where TAG is a url tag name.
+  -m STEP - Run iteration step as 'map', see Iteration section for details.
+  -r STEP - Get iteration results as 'reduce', see Results section for details.
+  -f ITER - Run full algorithm and iterate DIST-RANK steps ITER number of times.
+
+Iteration:
+
+  Algorithm iteration (map) can be executed with the following STEP values:
+
+  INIT - Initialize algorithm variables.
+  DIST - Distribute weighted probabilities to outlinks.
+  RANK - Update ranking values.
+  PUBL - Publish ranking values.
+
+  Each algorithm step is distributed but all steps are sequential, therefore
+  each step must start after the previous is completed. The ranking process
+  starts at step INIT and ends at step PUBL. Steps DIST-RANK should be repeated
+  until the desired maximum ranking change is reached - see DIST option in 
+  Results section.
+
+Results:
+
+  Results collection (reduce) can be executed with the following STEP values:
+
+  INIT - Get number of initialized documents.
+  DIST - Get maximum ranking change (algorithm stop condition).
+  RANK - Get number of rank-updated documents.
+  PUBL - Get calculated and published ranking distributions.
+EOF
+}
+
+# read options
+while getopts ano:t:m:r:f: opt
+do
+  case $opt in
+    a)  STRATEGY="-a";;
+    n)  STRATEGY="-n";;
+    o)  STRATEGY="-o $OPTARG";;
+    t)  TAG="-t $OPTARG";;
+    m)  ACTION="map"; STEP=$OPTARG;;
+    r)  ACTION="reduce"; STEP=$OPTARG;;
+    f)  ACTION="full"; ITER=$OPTARG
+        VERIFY=$(echo "$ITER > 0" | bc 2>&1)
+        if [ "$VERIFY" != 1 ]; then
+          syntax
+          exit 3
+        fi
+        ;;
+    *)  syntax
+        exit 4
+        ;;
+  esac
+done
+
+# validate input params
+if [ -z "$ACTION" ] || [ -z "$STRATEGY" ]; then
+  syntax
+  exit 5
+fi
+
+# to store request data
+TMPDIR=$(mktemp -d --tmpdir ec-XXXXXXXX)
+
+set_ranking_param() {
+  local VAR=$1
+  local VAL=$2
+  sed -i "s/^$VAR=.*/$VAR=$VAL/g" "$EC_JOB/ranking.conf"
+  if [ $? != 0 ]; then
+    echo "Failed to update job configuration file: '$EC_JOB/ranking.conf'"
+    exit 5
+  fi
+}
+
+# run distributed map on SHC
+run_dist_map() {
+  # count urls
+  URL_COUNT=$("$EC_BIN/ec-count-urls" $STRATEGY $TAG)
+
+  # get urls per job
+  URLS_PER_JOB=$((URL_COUNT / MAX_JOB_COUNT))
+  URLS_MOD_JOB=$((URL_COUNT % MAX_JOB_COUNT))
+  if [ $URLS_MOD_JOB -gt 0 ]; then
+    URLS_PER_JOB=$((URLS_PER_JOB+URLS_MOD_JOB))
+    URLS_MOD_JOB=0
+  fi
+
+  # run map/step jobs in parallel on each shard separatelly via SHC
+  "$EC_BIN/ec-index" -s "$ES_INDEX" | while read SHARD NODE IP
+  do
+    # update job conf
+    set_ranking_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+
+    # reset scroll id
+    rm -f "$EC_JOB/scroll.id" > /dev/null 2>&1
+
+    # get initial scroll id
+    "$EC_BIN/ec-list-urls" -s $SHARD -i "$EC_JOB/scroll.id" $STRATEGY $TAG
+  
+    # start jobs on Shellcloud cluster
+    shc start -s ec-ranking-step "$EC_JOB" ranking $STEP $URLS_PER_JOB
+    if [ $? != 0 ]; then
+      shc start -r ec-ranking-step "$EC_JOB" ranking $STEP $URLS_PER_JOB
+    fi
+  done
+}
+
+# clear rank index
+clear_rank_index() {
+  echo -n "Clearing ranking index "
+  local FORMAT="._indices.$ES_INDEX._shards.failed"
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/rank/_query"
+  RET=$(curl -sS -XDELETE "$REQUEST" -d @- <<EOF | jq -r -e $FORMAT 2>/dev/null)
+  {
+    "query" : {
+        "match_all" : {}
+    }
+  }
+EOF
+  if [ "$RET" = "0" ]; then
+    echo "OK"
+  else
+    echo "(FAILED)"
+    return
+  fi
+}
+
+# map INIT
+map_INIT() {
+  clear_rank_index
+  run_dist_map $@
+}
+
+# map DIST
+map_DIST() {
+  run_dist_map $@
+}
+
+# map RANK
+map_RANK() {
+  run_dist_map $@
+}
+
+# map PUBL
+map_PUBL() {
+  run_dist_map $@
+}
+
+# check INIT state (count all initialized rank documents)
+reduce_INIT() {
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/rank/_count?pretty"
+  local FORMAT='.count'
+  local NEW_RANK=$(curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -e $FORMAT)
+  {
+    "query" : {
+      "filtered" : {  
+        "filter" : {
+          "and" : [
+            { "term" : { "rank" : 1 } },
+            { "term" : { "prob" : 0 } }
+          ]
+        }
+      }
+    }
+  }
+EOF
+  echo "Number of initialized documents: $NEW_RANK"
+}
+
+# check DIST state (find maximum [rank - (1 - D + D * prob)
+reduce_DIST() {
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/rank/_search"
+  local FORMAT='.aggregations.max_diff.value'
+  local MAX_CHANGE=$(curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -e $FORMAT)
+  {
+    "size" : 0,
+    "aggregations" : {
+      "max_diff" : {
+        "max" : {
+          "script" : "ec_rank_prob_diff"
+        }
+      }
+    }
+  }
+EOF
+  echo "Maximum ranking change: $MAX_CHANGE"
+}
+
+# check RANK state (count [prob = 0])
+reduce_RANK() {
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/rank/_count?pretty"
+  local FORMAT='.count'  
+  local UPD_RANK=$(curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -e $FORMAT)
+  {
+    "query" : {
+      "term" : { "prob" : 0 }
+    }
+  }
+EOF
+  echo "Number of rank-updated documents: $UPD_RANK"
+}
+
+# get maximum rank value
+get_max_rank() {
+  # get maximum rank value that will set limit on rank distribution range
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/rank/_search?pretty"
+  local FORMAT='.aggregations.max_rank.value'
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -e $FORMAT
+  {
+    "size" : 0,
+    "aggregations" : {
+      "max_rank" : {
+        "max" : {
+          "field" : "rank"
+        }
+      }
+    }
+  }
+EOF
+}
+
+# list ranking distribution on specific document type
+list_distribution() {
+  # get document type and maximum rank value
+  local TYPE=$1
+  local MAX_RANK=$2
+
+  # define request URL for documnet TYPE
+  local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/$TYPE/_search?pretty"
+
+  # define rank distribution ranges
+  local RANK_STEPS=10
+  local RANK_STEP=$(awk -v R=$MAX_RANK -v S=$RANK_STEPS 'BEGIN{print R/S}')
+  local RANK_RANGE_1=$(awk -v S=$RANK_STEP -v M=1 'BEGIN{print M*S}')
+  local RANK_RANGE_2=$(awk -v S=$RANK_STEP -v M=2 'BEGIN{print M*S}')
+  local RANK_RANGE_3=$(awk -v S=$RANK_STEP -v M=3 'BEGIN{print M*S}')
+  local RANK_RANGE_4=$(awk -v S=$RANK_STEP -v M=4 'BEGIN{print M*S}')
+  local RANK_RANGE_5=$(awk -v S=$RANK_STEP -v M=5 'BEGIN{print M*S}')
+  local RANK_RANGE_6=$(awk -v S=$RANK_STEP -v M=6 'BEGIN{print M*S}')
+  local RANK_RANGE_7=$(awk -v S=$RANK_STEP -v M=7 'BEGIN{print M*S}')
+  local RANK_RANGE_8=$(awk -v S=$RANK_STEP -v M=8 'BEGIN{print M*S}')
+  local RANK_RANGE_9=$(awk -v S=$RANK_STEP -v M=9 'BEGIN{print M*S}')
+
+  # get number of docs in last range inluding ranks with MAX_RANK
+  local FORMAT=".hits.total"
+  local LAST_COUNT=$(curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -e -r $FORMAT)
+  {
+    "size" : 0,
+    "query" : {
+      "filtered" : {
+        "filter" : {
+          "range" : {
+            "rank" : {
+              "gte" : $RANK_RANGE_9, "lte" : $MAX_RANK
+            }
+          }
+        }
+      }
+    }
+  }
+EOF
+
+  # get distribution of docs in all ranges exluding ranks with MAX_RANK
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF | jq -r -e \
+  '.aggregations.rank_ranges.buckets[] | @text "\(.key)\t\(.doc_count)"' \
+  > "$TMPDIR/rank-dist-excl"
+  {
+    "size" : 0,
+    "aggs" : {
+      "rank_ranges" : {
+        "range" : {
+          "field" : "rank",
+          "ranges" : [
+              { "from" : 0, "to" : $RANK_RANGE_1 },
+              { "from" : $RANK_RANGE_1, "to" : $RANK_RANGE_2 },
+              { "from" : $RANK_RANGE_2, "to" : $RANK_RANGE_3 },
+              { "from" : $RANK_RANGE_3, "to" : $RANK_RANGE_4 },
+              { "from" : $RANK_RANGE_4, "to" : $RANK_RANGE_5 },
+              { "from" : $RANK_RANGE_5, "to" : $RANK_RANGE_6 },
+              { "from" : $RANK_RANGE_6, "to" : $RANK_RANGE_7 },
+              { "from" : $RANK_RANGE_7, "to" : $RANK_RANGE_8 },
+              { "from" : $RANK_RANGE_8, "to" : $RANK_RANGE_9 },
+              { "from" : $RANK_RANGE_9, "to" : $MAX_RANK }
+          ]
+        }
+      }
+    }
+  }
+EOF
+
+  # update last range of distribution to include ranks of value MAX_RANK
+  local LAST_RANGE=$(tail -n 1 $TMPDIR/rank-dist-excl | awk '{print $1}')
+  local LAST_CALC=$(tail -n 1 $TMPDIR/rank-dist-excl | awk '{print $2}')
+  local LAST_DIFF=$((LAST_COUNT-LAST_CALC))
+
+  # list the ranking distribution with last range inclusive
+  head -n 9 $TMPDIR/rank-dist-excl
+  echo "$LAST_RANGE\t$((LAST_CALC+LAST_DIFF))"
+}
+
+# check PUBL step (ranking distribution over [0:max rank] at step [max rank/10])
+reduce_PUBL() {
+  # get max rank value
+  local MAX_RANK=$(get_max_rank)
+  
+  # get calculated ranking distribution
+  list_distribution rank $MAX_RANK > $TMPDIR/rank-dist
+
+  # get published ranking distribution (output only rank values)
+  list_distribution page $MAX_RANK | awk '{print $2}' > $TMPDIR/page-dist
+
+  # combined distributions into one table
+  echo "[rank-range]\t[rank-dist]\t[publ-dist]" > $TMPDIR/all-dist
+  paste $TMPDIR/rank-dist $TMPDIR/page-dist >> $TMPDIR/all-dist
+
+  # get maximum columns widths
+  read ML1 ML2 ML3 <<EOF
+  $(cat $TMPDIR/all-dist | awk '
+    { 
+      if (length($1) > ML_1) ML_1=length($1)
+      if (length($2) > ML_2) ML_2=length($2)
+      if (length($3) > ML_3) ML_3=length($3) 
+    }
+    END {print ML_1, ML_2, ML_3}
+  ')
+EOF
+
+  echo "Ranking frequency distributions (calculated and published):"  
+  cat $TMPDIR/all-dist | awk -v ML1=$ML1 -v ML2=$ML2 -v ML3=$ML3 '
+    { printf "%"ML1"s\t""%"ML2"s\t""%"ML3"s\n", $1, $2, $3 }
+  '
+}
+
+# run pagerank iteration step 'map'
+run_map() {
+  # set job location
+  local EC_JOB="$EC_HOME/job/ranking-step"
+  map_$STEP
+}
+
+# run pagerank result collection 'reduce'
+run_reduce() {
+  reduce_$STEP
+}
+
+# run full pagerank algorithm
+run_full() {
+  # set job location
+  local EC_JOB="$EC_HOME/job/ranking-full"
+
+  # update job conf
+  set_ranking_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+  set_ranking_param ITERATION_COUNT "$ITER"
+
+  # run full pagerank on SHC
+  shc start -s ec-ranking-full "$EC_JOB" ranking $STRATEGY $TAG
+}
+
+# run action
+run_$ACTION
+
+# clear temp data
+rm -rf "$TMPDIR"
+

@@ -1,0 +1,116 @@
+#!/bin/sh
+
+SCRIPT=$(basename $0)
+SCRIPT_OPTIONS=$@
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# load job settings
+CONFIG="$PWD/$SCRIPT.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 3
+fi
+
+# setup logging
+if [ ! -d "$LOGS_DIRECTORY" ]; then
+  echo "Logs directory '$LOGS_DIRECTORY' is missing" >&2
+  exit 3
+fi
+EC_LOG="$LOGS_DIRECTORY/$SCRIPT-$JOB_DATE_TIME-$PPID.log"
+date >> "$EC_LOG"
+if [ $? != 0 ]; then
+  echo "Unable to access log file: '$EC_LOG'" >&2
+  exit 4
+fi
+
+# log start
+echo "Logging to $EC_LOG"
+echo "Host name/address: $SHC_HOST" >> "$EC_LOG"
+echo "Starting: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+
+# validate input arguments
+if [ $# != 1 ]; then
+cat << EOF
+Syntax: $SCRIPT <TAG>
+
+  Set tag on on urls given by scroll and scan.
+  The scroll id is stored in scroll.id file in job current folder.
+
+Options:
+
+  TAG - Tag to set on all urls selected by scroll id.
+EOF
+  exit 5
+fi
+
+# get input params
+TAG=$1
+
+# set scroll timeout
+SCROLL_TIME=10m
+
+# count tagged docs
+TAGGED_DOCS=0
+
+# define bulk update filter
+FORMAT='.hits.hits[]|{update: {_id: ._id}},{doc: {tag: "'$TAG'"}}'
+
+# scroll through source docs and add them to destination
+while [ 1 ]
+do
+
+  # get current docs and and increment ID
+  "$EC_BIN/ec-list-urls" -i scroll.id -f "$FORMAT" > update.bulk; RET=$?
+  if [ $RET != 0 ]; then
+    echo "Failed to scroll bulk of documents."
+    cat update.bulk
+    continue
+  fi
+
+  # if all docs have been updated, stop updating
+  CURRENT_DOCS=$(cat update.bulk | wc -l)
+  if [ $CURRENT_DOCS = 0 ]; then
+    break
+  fi
+
+  # bulk-update the docs on default index
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_bulk"
+  curl -sS -XPOST "$REQUEST" --data-binary @update.bulk > response; RET=$?
+  if [ $RET != 0 ]; then
+    echo "Failed to update bulk of documents."
+    jq . response
+    continue
+  fi
+
+  # update indexed docs count
+  TAGGED_DOCS=$((TAGGED_DOCS+CURRENT_DOCS/2))
+
+done >> "$EC_LOG" 2>&1
+
+# report number of updated docs
+echo "Tagged: $TAGGED_DOCS documents" >> "$EC_LOG"
+
+# log stop
+echo "Stopping: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+date >> "$EC_LOG"
+

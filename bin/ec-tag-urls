@@ -1,0 +1,129 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+syntax() {
+cat <<EOF
+Syntax: $0 {-f <FILE> | {{-a | -n | -o AGE} [-t <TAG>]}} -s <TAG>
+
+  Mark a set of urls with a tag.
+
+Options:
+
+  -f FILE - Read the urls from FILE file. If FILE is '-', read from stdin.
+  -a      - Select all urls in ES index.
+  -n      - Select new urls that have not been crawled yet.
+  -o AGE  - Select old urls crawled AGE ago, where AGE is ES age (1s, 2m, ect.).
+  -t TAG  - Limit selected urls to those with tag set to TAG.
+  -s TAG  - Set a new TAG tag on the selected urls.
+EOF
+}
+
+# assign input arguments
+while getopts f:ano:t:s: opt
+do
+  case $opt in
+    f)  ACTION='file'; INPUT=$OPTARG;
+        if [ $INPUT = '-' ]; then
+          INPUT="/dev/stdin"
+        fi
+        ;;
+    a)  ACTION='index'; STRATEGY="-a";;
+    n)  ACTION='index'; STRATEGY="-n";;
+    o)  ACTION='index'; STRATEGY="-o $OPTARG";;
+    t)  TAG_GET="-t $OPTARG";;
+    s)  TAG_SET=$OPTARG;;
+    *)  syntax
+        exit 2
+        ;;
+  esac
+done
+
+# validate input args
+if [ -z "$ACTION" ]; then
+  syntax
+  exit 3
+fi
+
+set_job_param() {
+  local VAR=$1
+  local VAL=$2
+  sed -i "s/^$VAR=.*/$VAR=$VAL/g" "$EC_JOB/urls-tag.conf"
+  if [ $? != 0 ]; then
+    echo "Failed to update job configuration file: '$EC_JOB/index-purge.conf'"
+    exit 5
+  fi
+}
+
+tag_file() {
+  # to store request data
+  BULKDATA=$(mktemp --tmpdir ec-XXXXXXXX)
+
+# read urls from file or stdin
+python -c "
+import sys, json
+sys.path.append('$EC_LIB')
+import elasticcrawler as ec
+
+# read URLS
+for url in sys.stdin:
+  # get id
+  url = url.strip()
+  id = ec.get_url_id(url)
+
+  # create update
+  action = {'update' : {'_id' : id}}
+  doc = {'doc' : {'tag' : '$TAG_SET'}}
+
+  # encode action in ES bulk format
+  jaction = json.JSONEncoder().encode(action)
+
+  # encode doc in ES bulk format
+  jdoc = json.JSONEncoder().encode(doc)
+
+  # output in ES bulk format
+  print jaction
+  print jdoc
+" < "$INPUT" > "$BULKDATA"
+
+  # post request
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_bulk?pretty"
+  curl -sS -XPOST "$REQUEST" --data-binary "@$BULKDATA"; RET=$?
+
+  # clean up
+  rm -f "$BULKDATA"
+  exit $RET
+}
+
+tag_index() {
+  # define job folder
+  EC_JOB="$EC_HOME/job/urls-tag"
+
+  # update job conf
+  set_job_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+
+  # run map jobs in parallel on each shard separatelly via SHC
+  "$EC_BIN/ec-index" -s "$ES_INDEX" | while read SHARD NODE IP
+  do
+    # reset scroll id
+    rm -f "$EC_JOB/scroll.id" > /dev/null 2>&1
+
+    # get initial scroll id
+    "$EC_BIN/ec-list-urls" -s $SHARD -i "$EC_JOB/scroll.id" $STRATEGY $TAG_GET
+
+    # start urls tag job on Shellcloud cluster
+    shc start -s ec-urls-tag "$EC_JOB" urls-tag $TAG_SET
+  done
+}
+
+tag_$ACTION

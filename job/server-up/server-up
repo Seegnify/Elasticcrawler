@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# update shellcloud
+SHC_PATH=$(which shc)
+if [ ! -e "$SHC_PATH" ]; then
+  echo "Missing shellcloud on PAHT."
+  exit 4
+fi
+SHC_HOME=$(dirname $(dirname "$SHC_PATH"))
+rm -rf "$SHC_HOME"/* > /dev/null 2>&1
+cp -rf shc/* "$SHC_HOME"
+
+# update RSH allowed hosts
+shc list -r -h > $HOME/.rhosts
+
+# start server
+"$EC_BIN/ec-server-start"

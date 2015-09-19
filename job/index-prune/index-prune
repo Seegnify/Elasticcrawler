@@ -1,0 +1,238 @@
+#!/bin/sh
+#
+# Index pruninig
+#
+
+SCRIPT=$(basename $0)
+SCRIPT_OPTIONS=$@
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# load job settings
+CONFIG="$PWD/$SCRIPT.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 3
+fi
+
+# validate input arguments
+if [ $# != 1 ]; then
+cat << EOF
+Syntax: $SCRIPT <PERCENT>
+  Prune a percentage of lowest ranked page documents and random node documents.
+
+Options:
+
+  PERCENT - Percentage of the default index to prune.
+EOF
+  exit 4
+fi
+
+# get input params
+PERCENT=$1
+
+# setup logging
+if [ ! -d "$LOGS_DIRECTORY" ]; then
+  echo "Logs directory '$LOGS_DIRECTORY' is missing" >&2
+  exit 5
+fi
+EC_LOG="$LOGS_DIRECTORY/$SCRIPT-$JOB_DATE_TIME-$PPID.log"
+date >> "$EC_LOG"
+if [ $? != 0 ]; then
+  echo "Unable to access log file: '$EC_LOG'" >&2
+  exit 6
+fi
+
+# log start
+echo "Starting: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+echo "Host name/address: $SHC_HOST" >> "$EC_LOG"
+
+# define bulk delete filter
+FORMAT='.hits.hits[]|{delete: {_id: ._id}}'
+
+prune_node() {
+  # calculate number of new node docs to prune
+  DCOUNT=$("$EC_BIN/ec-count-urls" -n)
+  echo "Total new node count: $DCOUNT"
+  DCOUNT=$(echo "scale=100; ($PERCENT/100 * $DCOUNT)" | bc)
+  DCOUNT=$(echo "$DCOUNT/1" | bc)
+  echo "Node(s) to prune: $DCOUNT"
+
+  # get initial scan over new node documents
+  echo "Scanning new node documents..."
+  rm scroll.id > /dev/null 2>&1
+  "$EC_BIN/ec-list-urls" -n -i scroll.id
+
+  # keep track of purging progress
+  local PRUNED=0
+  local LAST_PROGRESS=none
+
+  # run bulk delete loop
+  while test $PRUNED -lt $DCOUNT
+  do
+    # get batch of documents
+    "$EC_BIN/ec-list-urls" -i scroll.id -f "$FORMAT" > delete.all
+    BULK_COUNT=$(cat delete.all | wc -l)
+
+    # get percentage of documents in random order
+    BULK_COUNT=$(echo "scale=100; ($PERCENT/100 * $BULK_COUNT)" | bc)
+    BULK_COUNT=$(echo "$BULK_COUNT/1" | bc)
+    shuf delete.all | head -n $BULK_COUNT > delete.bulk
+
+    # stop if nothing to delete
+    if [ $BULK_COUNT = 0 ]; then
+      break;
+    fi
+
+    # increment prune counter
+    PRUNED=$((PRUNED+BULK_COUNT))
+
+    # log progress
+    local PROGRESS=$(echo "scale=3; 100*($PRUNED/$DCOUNT)" | bc)
+    if [ $PROGRESS != $LAST_PROGRESS ]; then
+      echo "Purging node(s) at $PROGRESS [%]"
+    fi
+    LAST_PROGRESS=$PROGRESS
+
+    # bulk delete node docs
+    REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_bulk"
+    curl -sS -XPOST "$REQUEST" --data-binary @delete.bulk > /dev/null
+  done
+
+  # clear remaining scroll
+  echo "Clearing node scroll..."
+  curl -sS -XDELETE $ES_HOST:$ES_PORT/_search/scroll -d $(cat scroll.id) | jq .
+}
+
+prune_page() {
+  # calculate number of node docs to prune
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/page/_count"
+  DCOUNT=$(curl -Ss "$REQUEST" | jq .count)
+  echo "Total page count: $DCOUNT"
+  DCOUNT=$(echo "scale=100; ($PERCENT/100 * $DCOUNT)" | bc)
+  DCOUNT=$(echo "$DCOUNT/1" | bc)
+  echo "Page(s) to prune: $DCOUNT"
+
+  # get initial scroll over page documents
+  echo "Scrolling page documents..."
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/page/_search?scroll=1m"
+  curl -sS -XGET "$REQUEST" -d @- <<EOF > results
+  {
+    "size" : $BULK_SIZE,
+    "query": {
+      "function_score": {
+        "query" : {
+          "match_all" : {}
+        },
+        "script_score": {
+          "script": "ec_page_rank"
+        },
+        "boost_mode": "replace"
+      }
+    },
+    "fields" : [],
+    "sort" : [
+      { "_score" : {"order" : "asc"} }
+    ]
+  }
+EOF
+
+  # keep track of purging progress
+  local PRUNED=0
+  local LAST_PROGRESS=none
+
+  # run bulk delete loop
+  while test $PRUNED -lt $DCOUNT
+  do
+    # build bulk delete set from ranked docs
+    SCROLL_ID=$(jq -r ._scroll_id results)
+    jq -r "$FORMAT" results > delete.all
+    head -n $((DCOUNT-PRUNED)) delete.all > delete.bulk
+    BULK_COUNT=$(cat delete.bulk | wc -l)
+
+    # stop if nothing to delete
+    if [ $BULK_COUNT = 0 ]; then
+      break;
+    fi
+
+    # increment prune counter
+    PRUNED=$((PRUNED+BULK_COUNT))
+
+    # log progress
+    local PROGRESS=$(echo "scale=3; 100*($PRUNED/$DCOUNT)" | bc)
+    if [ $PROGRESS != $LAST_PROGRESS ]; then
+      echo "Purging node(s) at $PROGRESS [%]"
+    fi
+    LAST_PROGRESS=$PROGRESS
+
+    # bulk delete page and corresponding node docs
+    REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/page/_bulk"
+    curl -sS -XPOST "$REQUEST" --data-binary @delete.bulk > /dev/null
+
+    REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_bulk"
+    curl -sS -XPOST "$REQUEST" --data-binary @delete.bulk > /dev/null
+
+    # scroll next batch of pages
+    REQUEST="$ES_HOST:$ES_PORT/_search/scroll?scroll=1m"
+    curl -sS -XGET "$REQUEST" -d "$SCROLL_ID" > results
+  done
+
+  # clear remaining scroll
+  echo "Clearing page scroll..."
+  curl -sS -XDELETE $ES_HOST:$ES_PORT/_search/scroll -d "$SCROLL_ID" | jq .
+}
+
+
+# prune node documents
+if [ "$NODE_PURGING" = "true" ]; then
+  date >> "$EC_LOG"
+  echo "Purging node documents..." >> "$EC_LOG"
+  prune_node >> "$EC_LOG" 2>&1
+  echo "Node(s) pruned with code ($?)" >> "$EC_LOG"
+else
+  echo "Node purging disabled (NODE_PURGING == false)" >> "$EC_LOG"
+fi
+
+# prune page documents
+if [ "$PAGE_PURGING" = "true" ]; then
+  date >> "$EC_LOG"
+  echo "Purging page documents..." >> "$EC_LOG"
+  prune_page >> "$EC_LOG" 2>&1
+  echo "Page(s) pruned with code ($?)">> "$EC_LOG"
+else
+  echo "Page purging disabled (PAGE_PURGING == false)" >> "$EC_LOG"
+fi
+
+# optimize the index to release the storage space
+if [ "$OPTIMIZE_INDEX" = "true" ]; then
+  date >> "$EC_LOG"
+  echo "Optimizing index..." >> "$EC_LOG"
+  "$EC_BIN/ec-index" -o "$ES_INDEX" >> "$EC_LOG" 2>&1
+  echo "Index optimized with code ($?)" >> "$EC_LOG"
+else
+  echo "Index optimization disabled (OPTIMIZE_INDEX == false)"
+fi
+
+# log stop
+echo "Stopping: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+date >> "$EC_LOG"
+

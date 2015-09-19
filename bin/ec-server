@@ -1,0 +1,237 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+EC_CONF="$EC_HOME/conf"
+CONFIG="$EC_CONF/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+SCRIPT=$(basename $0)
+syntax() {
+cat <<EOF 
+Syntax: $SCRIPT start|stop|status|config
+
+  Control EC server on localhost.
+
+Options:
+
+  start  - Start server.
+  stop   - Stop server.
+  status - Display status.
+  config - Display configuration.
+
+EOF
+}
+
+if [ $# != 1 ]; then
+  syntax
+  exit 2
+fi
+
+ACTION=$1
+
+# read options
+case $ACTION in
+  start) ;;
+  stop)  ;;
+  status);;
+  config);;
+  *) syntax
+     exit 3
+     ;;
+esac
+
+# start content parser
+server_start() {
+  local PARSER_CMD="java -jar $TIKA_PARSER_JAR -T -s $TIKA_PARSER_PORT"
+  nc -z localhost $TIKA_PARSER_PORT
+  if [ $? != 0 ]; then
+    echo -n "Starting Tika parse server on port $TIKA_PARSER_PORT "
+    nohup $PARSER_CMD > /dev/null 2>&1 &
+    # wait for the port bind
+    local TIMEOUT=30
+    while [ $TIMEOUT != 0 ]
+    do
+      echo -n '.'
+      sleep 1
+      nc -z localhost $TIKA_PARSER_PORT
+      if [ $? = 0 ]; then
+        echo " OK"
+        return 0
+      fi
+      TIMEOUT=$((TIMEOUT-1))
+    done
+    echo " ERROR"
+    return 1
+  fi
+}
+
+# stop content parser
+server_stop() {
+  # find content parser
+  PARSER_CMD="java -jar .*tika-app.* -T -s"
+  PARSER_PID=$(pgrep -f "^$PARSER_CMD")
+  if [ -z "$PARSER_PID" ]; then
+    echo "Tika parse server not running"
+  else
+    echo "Stopping Tika parse server"
+    kill -TERM $PARSER_PID
+  fi
+}
+
+# report parser status
+server_status() {
+  # find content parser
+  PARSER_CMD="java -jar .*tika-app.* -T -s"
+  pgrep -a -f "^$PARSER_CMD"
+  if [ $? != 0 ]; then
+    echo "Tika parse server not running."
+  fi
+}
+
+check_command() {
+  local NAME=$1
+  local COMMAND=$(which $NAME)
+  if [ -f "$COMMAND" ]; then
+    echo "OK - $NAME present at $COMMAND"
+  else
+    echo "ERROR - $NAME missing on PATH"
+  fi
+}
+
+check_file() {
+  local NAME=$1
+  local FILE=$2
+  if [ -f "$FILE" ] ; then
+    echo "OK - $NAME file present at $FILE"
+  else
+    echo "ERROR - $NAME file missing at $FILE"
+  fi
+}
+
+check_dir() {
+  local NAME=$1
+  local FILE=$2
+  if [ -d "$FILE" ] ; then
+    echo "OK - $NAME folder present at $FILE"
+  else
+    echo "ERROR - $NAME folder missing at $FILE"
+  fi
+}
+
+check_sysctl() {
+  local VAR=$1
+  local VAL_EXP=$2
+  local VAL_ACT=$(/sbin/sysctl -n "$VAR")
+  if [ "$VAL_ACT" = "$VAL_EXP" ]; then
+    echo "OK - sysctl $VAR = $VAL_ACT"
+  else
+    echo "ERROR - sysctl $VAR = $VAL_ACT, should be set to $VAL_EXP"
+  fi
+}
+
+check_python() {
+local MODULE=$1
+python -c "import $MODULE" > /dev/null 2>&1
+if [ $? = 0 ]; then
+    echo "OK - python module $MODULE present"
+else
+    echo "ERROR - python or its module $MODULE missing"
+fi
+}
+
+check_host() {
+  NAME=$1
+  HOST=$2
+  PORT=$3
+  #ssh -o PasswordAuthentication=no $HOST pwd > /dev/null 2>&1; RET=$?
+  ssh -o BatchMode=yes $HOST pwd > /dev/null 2>&1; RET=$?
+  if [ $RET != 0 ]; then
+    echo "ERROR - host $HOST not accessible with key authentication"
+  else
+    echo "OK - host $HOST accessible with key authentication"
+  fi
+}
+
+check_content_parser() {
+  CONTENT="<html><head><title>123456</title></head></html>"
+  TITLE=$(echo $CONTENT | timeout -k 10 10 nc localhost $TIKA_PARSER_PORT)
+  HOST_PORT="localhost:$TIKA_PARSER_PORT"
+  if [ "$TITLE" = "123456" ]; then
+    echo "OK - tika parse server present at $HOST_PORT"
+  else
+    echo "ERROR - tika parse server at $HOST_PORT down or nc missing"
+  fi
+}
+
+check_elasticsearch() {
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/_nodes/process?pretty"
+  curl "$REQUEST" > /dev/null 2>&1
+  if [ $? = 0 ]; then
+    echo "OK - elasticsearch present at $ES_HOST:$ES_PORT"
+  else
+    echo "ERROR - elasticsearch at $ES_HOST:$ES_PORT down or curl missing"
+  fi
+}
+
+# show server configuration
+server_config() {
+  # check curl path
+  check_command curl
+
+  # check python path
+  check_command python
+
+  # check python module
+  check_python IPy
+
+  # check python module
+  check_python pycurl
+
+  # check python module
+  check_python BeautifulSoup
+
+  # check nc
+  check_command nc
+
+  # check jq
+  check_command jq
+
+  # check awk
+  check_command awk
+
+  # check shellcloud
+  check_command shc
+
+  # check java
+  check_command java
+
+  # check logs folder
+  check_dir logs "$LOGS_DIRECTORY"
+
+  # check tika
+  check_file tika "$TIKA_PARSER_JAR"
+
+  # check if curl will be able to reuse network connections
+  # check_sysctl net.ipv4.tcp_tw_reuse 1
+
+  # start local servers
+  "$EC_BIN/ec-server-start" > /dev/null 2>&1
+
+  # check content parser
+  check_content_parser
+
+  # check elasticsearch
+  check_elasticsearch
+}
+
+server_$ACTION
+exit $?
+

@@ -1,0 +1,85 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+EC_CONF="$EC_HOME/conf"
+CONFIG="$EC_CONF/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+# validate input arguments
+if [ $# -lt 1 ]; then
+  echo "Syntax: $0 {<FILE> | -} [HOST]
+
+Options:
+
+  FILE - file to read the urls from (one url per line).
+  '-'  - read urls from standard input (one url per line).
+  HOST - host to connect to when creating urls (default is ES_HOST)."
+  exit 3
+fi
+
+# assign input arguments
+if [ "$1" = "-" ]; then
+  INPUT="/dev/stdin"
+else
+  INPUT=$1
+fi
+
+if [ ! -z "$2" ]; then
+  ES_HOST=$2
+fi
+
+# to store request data
+BULKDATA=$(mktemp --tmpdir ec-XXXXXXXX)
+
+# generate request data
+python -c "
+import sys, json, hashlib
+from urlparse import urlparse, urlunparse
+sys.path.append('$EC_LIB')
+import elasticcrawler as ec
+
+# read URLS, output bulk index
+for url in sys.stdin:
+  url = url.strip()
+
+  # check host
+  if not ec.is_client_access_allowed(url, '$CONFIG', 
+  '$EC_CONF/allowed.hosts', '$EC_CONF/excluded.hosts'):
+    continue
+
+  # get id
+  id = ec.get_url_id(url)
+
+  # create dictionaries
+  action = {'create' : {'_id' : id}}
+  doc = {'url' : url}
+
+  # conver to json
+  jaction = json.JSONEncoder().encode(action)
+  jdoc = json.JSONEncoder().encode(doc)
+
+  # output in ES bulk format
+  print jaction
+  print jdoc
+" < "$INPUT" > "$BULKDATA"; RET=$?
+if [ $RET != 0 ]; then
+  rm -f "$BULKDATA"
+  exit $RET
+fi
+
+# post request
+REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_bulk?pretty"
+curl -sS -XPOST "$REQUEST" --data-binary @$BULKDATA; RET=$?
+
+# clean up
+rm -f "$BULKDATA"
+exit $RET
+

@@ -1,0 +1,124 @@
+#!/bin/sh
+#
+# PageRank loop
+#
+
+SCRIPT=$(basename $0)
+SCRIPT_OPTIONS=$@
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# load job settings
+CONFIG="$PWD/$SCRIPT.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 3
+fi
+
+# validate config arguments
+if [ -z "$ITERATION_COUNT" ]; then
+cat << EOF
+Syntax: $SCRIPT [LIST_URLS_OPTS]
+
+  Full PageRank algorithm running with given number of iterations.
+
+Options:
+
+  LIST_URLS_OPTS - See ec-list-urls for details.
+
+Config:
+
+  ITERATION_COUNT - The number of times DIST-RANK steps are repeated.
+EOF
+  exit 4
+fi
+
+# setup logging
+if [ ! -d "$LOGS_DIRECTORY" ]; then
+  echo "Logs directory '$LOGS_DIRECTORY' is missing" >&2
+  exit 5
+fi
+EC_LOG="$LOGS_DIRECTORY/$SCRIPT-$JOB_DATE_TIME-$PPID.log"
+date >> "$EC_LOG"
+if [ $? != 0 ]; then
+  echo "Unable to access log file: '$EC_LOG'" >&2
+  exit 6
+fi
+
+# log start
+echo "Starting: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+echo "Host name/address: $SHC_HOST" >> "$EC_LOG"
+echo "Number of iterations: $ITERATION_COUNT" >> "$EC_LOG"
+
+# ranking step routine
+pagerank_step() {
+  local STEP=$1
+  local WAIT=60
+
+  echo "Starting: $EC_BIN/ec-ranking $SCRIPT_OPTIONS -m $STEP"
+  "$EC_BIN/ec-ranking" $SCRIPT_OPTIONS -m $STEP
+
+  echo "Waiting for $STEP ..."
+  while test $(shc list -r -j ec-ranking-step | wc -l) != 0
+  do
+    sleep $WAIT
+  done
+
+  echo "Refreshing index ..." 
+  "$EC_BIN/ec-index" -r 0
+}
+
+# full ranking routine
+pagerank_full() {
+  pagerank_step INIT
+
+  local COUNT=1
+  while test "$COUNT" -le "$ITERATION_COUNT"
+  do
+    # log iteration status
+    echo "Iteration $COUNT of $ITERATION_COUNT"
+    pagerank_step DIST
+
+    # get maximum ranking change
+    RANK_CHANGE=$("$EC_BIN/ec-ranking" $SCRIPT_OPTIONS -r DIST)
+    echo $RANK_CHANGE
+
+    # update ranking
+    pagerank_step RANK
+    COUNT=$((COUNT+1))
+  done
+
+  pagerank_step PUBL
+
+  # log last maximum ranking change
+  if [ ! -z "$RANK_CHANGE" ]; then
+    echo $RANK_CHANGE
+  fi
+}
+
+# run full ranking
+pagerank_full >> "$EC_LOG"
+
+# log stop
+echo "Stopping: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+date >> "$EC_LOG"
+

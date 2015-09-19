@@ -1,0 +1,145 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+# show script syntax
+syntax() {
+  echo "Syntax: $0 {-a|-n|-o <AGE>}
+  
+Options:
+
+  -a     - List tags of any urls in ES index.
+  -n     - List tags of new urls that have not been crawled yet.
+  -o AGE - List tags of old urls crawled AGE ago, where AGE is ES age (1s, 2m, ect.)."
+}
+
+# validate input params
+if [ $# -lt 1 ]; then
+  syntax
+  exit 2
+fi
+
+# read input params
+while getopts ano: opt
+do
+  case $opt in
+    a)  STRATEGY=any;;
+    n)  STRATEGY=new;;
+    o)  STRATEGY=old; AGE=$OPTARG;;
+  esac
+done
+
+# check required arguments
+if [ -z "$STRATEGY" ] ; then
+  syntax
+  exit 3
+fi
+
+# create error log
+ERRLOG=$(mktemp)
+if [ ! -f $ERRLOG ]; then
+  exit 2
+fi
+
+# get summary of all tags
+list_any() {
+REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_search?search_type=count&pretty"
+FORMAT='.aggregations.any_tags.buckets[].key'
+curl -sS -XPOST "$REQUEST" -d @- <<EOF 2>> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+{
+  "aggregations" : {
+    "any_tags" : {
+      "terms" : {
+        "field" : "tag",
+        "size" : 0
+      }
+    }
+  }
+}
+EOF
+}
+
+# get summary of new tags
+list_new() {
+REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_search?pretty"
+FORMAT='.aggregations.new_tags.unique.buckets[].key'
+curl -sS -XPOST "$REQUEST" -d @- <<EOF 2>> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG 
+{
+  "aggregations" : {
+    "new_tags" : {
+      "filter" : { "missing" : { "field" : "status" } },
+      "aggregations" : {
+        "unique" : {
+          "terms" : {
+            "field" : "tag",
+            "size" : 0
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+}
+
+# get summary of old tags
+list_old() {
+REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_search?pretty"
+FORMAT=".aggregations.old_tags.unique.buckets[].key"
+curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+{
+  "aggregations" : {
+    "old_tags" : {
+      "filter" : { 
+        "and" : [
+          { "exists" : { "field" : "status" } },
+          { "range" : { "_timestamp" : { "lt" : "now-$AGE" } } }
+        ]
+      },
+      "aggregations" : {
+        "unique" : {
+          "terms" : {
+            "field" : "tag",
+            "size" : 0
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+}
+
+# list according to strategy
+case $STRATEGY in
+  any) list_any;;
+  new) list_new;;
+  old)
+    if [ -z "$AGE" ]; then
+      syntax
+      exit 3
+    fi
+    list_old
+    ;;
+  *)  
+    syntax
+    exit 4
+    ;;
+esac
+
+# print error log and return log size
+cat $ERRLOG 1>&2
+RET=$(stat -c '%s' $ERRLOG)
+rm $ERRLOG
+exit $RET
+

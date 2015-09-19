@@ -1,0 +1,267 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+# define scroll size and time
+SCROLL_SIZE=1000
+SCROLL_TIME=10m
+
+# show script syntax
+syntax() {
+cat <<EOF
+  Syntax: $0 {-a|-n|-o <AGE>} 
+             [-h <HOST>] [-s <SHARD>] [-t <TAG>] [-f <FILTER>]
+             -i <SID>
+
+  List urls by age, shard, host or tag using scroll ID.
+
+Options:
+
+  -a        - Select all urls in ES index.
+  -n        - Select new urls that have not been crawled yet.
+  -o AGE    - Select old urls crawled AGE ago, where AGE is ES age (1s,2m,ect.).
+  -h HOST   - Restrict the list to a host , where HOST is ES node id.
+  -s SHARD  - Restrict the list to a shard, where SHARD is ES shard id.
+  -t TAG    - Limit selected urls to those with tag set to TAG.
+  -i SCRID  - File to store ES scroll ID. The ID is updated on each scroll.
+  -f FILTER - Define custom filter format for listing urls. Defaults to URLs.
+EOF
+}
+
+# read input params
+while getopts ano:h:s:t:i:f: opt
+do
+  case $opt in
+    a)  STRATEGY=any;;
+    n)  STRATEGY=new;;
+    o)  STRATEGY=old; AGE=$OPTARG;;
+    h)  if [ "$PREF" != "" ]; then
+          PREF="$PREF;"
+        fi
+        PREF=${PREF}_only_node:$OPTARG;;
+    s)  if [ "$PREF" != "" ]; then
+          PREF="$PREF;"
+        fi
+        PREF=${PREF}_shards:$OPTARG;;
+    t)  TAG=$OPTARG;;
+    i)  SCRID=$OPTARG;;
+    f)  FILTER=$OPTARG;;
+    *)  syntax; exit 2;;
+  esac
+done
+
+# check required arguments
+if [ -z "$SCRID" ]; then
+  syntax
+  exit 3
+fi
+
+# cleanup on singal
+trap onsignal HUP INT TERM
+
+# signal handler
+onsignal() {
+  cleanup
+  exit 4
+}
+
+# cleanup routine
+cleanup() {
+  rm -rf $TMPDIR
+}
+
+# create error log
+TMPDIR=$(mktemp -d --tmpdir ec-XXXXXXXX)
+if [ ! -d $ERRLOG ]; then
+  exit 4
+fi
+ERRLOG=$TMPDIR/errlog
+SCROLL=$TMPDIR/scroll
+
+# create scroll file, if it does not exists
+if [ ! -f "$SCRID" ]; then
+  touch "$SCRID" 2>> $ERRLOG
+  if [ $? != 0 ]; then
+    echo "Failed to access scroll ID file '$SCRID'." 2>> $ERRLOG
+    exit 5 
+  fi
+fi
+
+# read scroll id
+SCROLL_ID=$(cat "$SCRID") 2>> $ERRLOG
+if [ $? != 0 ]; then
+  echo "Failed to read scroll ID from file '$SCRID'." 2>> $ERRLOG
+  exit 6
+fi
+
+list_any() {
+if [ -z "$TAG" ]; then
+  # list all urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "match_all" : {}
+    },
+    "fields" : ["url"]
+  }
+EOF
+else
+  # list all tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "term" : { "tag" : "$TAG" }
+    },
+    "fields" : ["url"]
+  } 
+EOF
+fi
+}
+
+list_new() {
+if [ -z "$TAG" ]; then
+  # list all new urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "filter" : {
+          "missing" : { "field" : "status" }
+        }
+      }
+    },
+    "fields" : ["url"]
+  }
+EOF
+else
+  # list all new tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "query" : {
+          "term" : { "tag" : "$TAG" }
+        },
+        "filter" : {
+          "missing" : { "field" : "status" }
+        }
+      }
+    },
+    "fields" : ["url"]
+  }
+EOF
+fi
+}
+
+list_old() {
+if [ -z "$TAG" ]; then
+  # list all due urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "filter" : {
+          "and" : [
+            { "exists" : { "field" : "status" } },
+            { "range" : { "_timestamp" : { "lt" : "now-$AGE" } } }
+          ]
+        }
+      }
+    },
+    "fields" : ["url"]
+  }
+EOF
+else
+  # list all due tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF > "$SCROLL" 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "query" : { 
+          "term" : { "tag" : "$TAG" } 
+        },
+        "filter" : {
+          "and" : [
+            { "exists" : { "field" : "status" } },
+            { "range" : { "_timestamp" : { "lt" : "now-$AGE" } } }
+          ]
+        }
+      }
+    },
+    "fields" : ["url"]
+  }
+EOF
+fi
+}
+
+# if scroll id is empty, init scroll, otherwise iterate scroll
+if [ -z "$SCROLL_ID" ]; then
+
+  # initial scan and scroll
+  REQUEST_OPTS="preference=$PREF&search_type=scan"
+  REQUEST_OPTS="$REQUEST_OPTS&scroll=$SCROLL_TIME&size=$SCROLL_SIZE"
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_search?$REQUEST_OPTS"
+
+  # start scrolling according to strategy
+  case $STRATEGY in
+    any) list_any;;
+    new) list_new;;
+    old)
+      if [ -z "$AGE" ]; then
+        syntax
+        exit 3
+      fi
+      list_old
+      ;;
+    *)  
+      syntax
+      exit 4
+      ;;
+  esac
+
+else
+
+  # iterate scroll and scan
+  REQUEST_OPTS="scroll=$SCROLL_TIME&scroll_id=$SCROLL_ID"
+  REQUEST="$ES_HOST:$ES_PORT/_search/scroll?$REQUEST_OPTS"
+  curl -sS -XGET "$REQUEST" > "$SCROLL" 2>> $ERRLOG
+
+fi
+
+#
+# Define json filters
+#
+# A "printf" like formating can be achieved with @text directive:
+# '.hits.hits[] | @text "\(._id)\t\(.fields.url[0])"'
+#
+# String concatenation can be achieved with join function:
+# '.hits.hits[] | [._id, .fields.url[0]] | join("\t")'
+#
+FORMAT_SID='._scroll_id'
+if [ -z "$FILTER" ]; then
+  FILTER='.hits.hits[].fields.url[0]'
+fi
+
+# save scroll id
+jq -r "$FORMAT_SID" $SCROLL > "$SCRID" 2>> $ERRLOG
+
+# output urls by filter
+jq -r -c "$FILTER" "$SCROLL" 2>> $ERRLOG
+
+# print error log and return log size
+cat $ERRLOG 1>&2
+RET=$(stat -c '%s' $ERRLOG)
+cleanup
+exit $RET
+
+

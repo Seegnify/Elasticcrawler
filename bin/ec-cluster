@@ -1,0 +1,187 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+syntax() {
+cat <<EOF 
+Syntax: $SCRIPT -r | -p | -u | -m | -c | -h | -s | -t SPEED
+
+  Control cluster of servers and provides run-time statistics.
+
+Options:
+
+  -r       - Start cluster.
+  -p       - Stop cluster.
+  -u       - Report cluster status.
+  -m       - Report memory stats.
+  -n       - Report cluster nodes.
+  -c       - Report cache stats.
+  -h       - Report cluster health.
+  -i       - Report culster settings.
+  -s       - Report culster shards.
+  -t SPEED - Throttle culster IO to SPEED. Negative SPEED turns throttling off.
+EOF
+}
+
+# read options
+while getopts rpuhcmnsit: opt
+do
+  case $opt in
+  r) ACTION="start";;
+  p) ACTION="stop";;
+  u) ACTION="status";;
+  h) ACTION="health";;
+  m) ACTION="memory";;
+  n) ACTION="nodes";;
+  s) ACTION="shards";;
+  i) ACTION="settings";;
+  t) ACTION="throttle"; SPEED=$OPTARG;;
+  *) syntax
+     exit 3
+     ;;
+  esac
+done
+shift $(expr $OPTIND - 1)
+
+# validate options
+if [ -z "$ACTION" ]; then
+  syntax
+  exit 2
+fi
+
+cluster_start() {
+  EC_JOB="$EC_HOME/job/server-up"
+
+  # update shellcloud on each Shellcloud host
+  SHC_HOME=$(dirname $(dirname $(which shc)))
+  if [ $? != 0 ]; then
+    echo "Missing shellcloud on PAHT."
+    exit 4    
+  fi
+  rm -rf "$EC_JOB/shc" > /dev/null 2>&1
+  cp -rf "$SHC_HOME" "$EC_JOB/shc"
+
+  # start server on each Shellcloud host
+  shc list -s -h | while read HOST
+  do
+    shc start -s @$HOST ec-server-up "$EC_JOB" server-up
+  done
+
+  # remove shellcloud copy
+  rm -rf "$EC_JOB/shc" > /dev/null 2>&1
+}
+
+cluster_stop() {
+  EC_JOB="$EC_HOME/job/server-down"
+
+  # stop server on each Shellcloud host
+  shc list -s -h | while read HOST
+  do
+    shc start -s @$HOST ec-server-down "$EC_JOB" server-down
+  done
+}
+
+cluster_status() {
+  # check status on each Shellcloud host
+  shc list -s -h | while read HOST
+  do
+
+    nc -z $HOST 22
+    if [ $? = 0 ]; then
+      SSH="UP"
+    else
+      SSH="DOWN"
+    fi
+
+    nc -z $HOST 514
+    if [ $? = 0 ]; then
+      RSH="UP"
+    else
+      RSH="DOWN"
+    fi
+
+    nc -z $HOST $TIKA_PARSER_PORT
+    if [ $? = 0 ]; then
+      TIKA="UP"
+    else
+      TIKA="DOWN"
+    fi
+
+    echo "Status: host=$HOST ssh=$SSH rsh=$RSH tika=$TIKA"
+
+  done
+}
+
+cluster_shards() {
+  # list cluster shards allocation
+  curl -sS "$ES_HOST:$ES_PORT/_search_shards" | jq .
+}
+
+
+cluster_memory() {
+  # check cache usage on cluster
+  local SCOPE="_nodes/stats/indices/fielddata?level=indices&fields=*&human"
+  curl -Ss "$ES_HOST:$ES_PORT/$SCOPE" | jq .
+}
+
+cluster_nodes() {
+  # list cluster nodes and process info
+  local SCOPE="_nodes/process"
+  curl -Ss "$ES_HOST:$ES_PORT/$SCOPE" | jq .
+}
+
+cluster_cache() {
+  # check cache usage on cluster
+  local SCOPE="_nodes/stats/indices/query_cache?human"
+  curl -Ss "$ES_HOST:$ES_PORT/$SCOPE" | jq .
+}
+
+cluster_settings() {
+  # display cluster settings
+  curl -Ss "$ES_HOST:$ES_PORT/_cluster/settings" | jq .
+}
+
+cluster_health() {
+  curl -Ss "$ES_HOST:$ES_PORT/_cluster/health" | jq -r .
+}
+
+cluster_throttle() {
+  # throttle cluster IO
+  local REQUEST="$ES_HOST:$ES_PORT/_cluster/settings"
+  local TYPE="all"
+
+  # turn throttling off
+  NEGATIVE=$(echo "$SPEED < 0" | bc 2>&1)
+  if [ "$NEGATIVE" = "1" ]; then
+    TYPE="none"
+    SPEED=0
+  fi
+
+  # set throttling
+  curl -Ss -XPUT "$REQUEST" -d @- <<EOF | jq .
+  {
+    "transient" : {
+      "indices.store.throttle.type" : "$TYPE"
+    }
+  }
+EOF
+  curl -Ss -XPUT "$REQUEST" -d @- <<EOF | jq .
+  {
+    "transient" : {
+      "indices.store.throttle.max_bytes_per_sec" : "$SPEED"
+    }
+  }
+EOF
+}
+
+cluster_$ACTION

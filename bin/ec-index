@@ -1,0 +1,373 @@
+#!/bin/sh
+#
+# Copy ES index
+#
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+SCRIPT=$(basename $0)
+syntax() {
+cat <<EOF 
+Syntax: $SCRIPT -l | {-n|-m|-c|-d|-h|-o} <INDEX>|-p <PERCENT>|-q <QUERY>
+
+  Manage elasticsearch indexes.
+
+Options:
+
+  -l         - List all indices in the cluster.
+  -n INDEX   - Create a new index INDEX.
+  -m INDEX   - List mapping definition of an index INDEX.
+  -c INDEX   - Copy the default index to another index INDEX.
+  -d INDEX   - Delete an existing index INDEX.
+  -h INDEX   - Report health status of an index INDEX.
+  -o INDEX   - Optimize an existing index INDEX.
+  -s INDEX   - List shards of an index INDEX.
+  -p PERCENT - Prune PERCENT percentage of the default index.
+  -q QUERY   - Search the default index with specified QUERY.
+  -r RATE    - Set the default index refresh rate to RATE, or 0 to refresh now.
+  -e NUMREPS - Set number of replicas for the default index to NUMREPS.
+EOF
+}
+
+# read options
+while getopts ln:m:c:d:h:o:p:q:s:r:e: opt
+do
+  case $opt in
+    l)  ACTION="list";;
+    n)  ACTION="new";       ES_INDEX=$OPTARG;;
+    m)  ACTION="mapping";   ES_INDEX=$OPTARG;;
+    c)  ACTION="copy";      TARGET_INDEX=$OPTARG;;
+    d)  ACTION="delete";    ES_INDEX=$OPTARG;;
+    h)  ACTION="health";    ES_INDEX=$OPTARG;;
+    o)  ACTION="optimize";  ES_INDEX=$OPTARG;;
+    p)  ACTION="prune";     PERCENT=$OPTARG;;
+    q)  ACTION="search";    QUERY=$OPTARG;;
+    s)  ACTION="shards";    ES_INDEX=$OPTARG;;
+    r)  ACTION="refresh";   RATE=$OPTARG;;
+    e)  ACTION="replicas";  NUMREPS=$OPTARG;;
+    *)  syntax
+        exit 3
+        ;;
+  esac
+done
+
+# validate input args
+if [ -z "$ACTION" ]; then
+  syntax
+  exit 4
+fi
+
+set_copy_param() {
+  local VAR=$1
+  local VAL=$2
+  sed -i "s/^$VAR=.*/$VAR=$VAL/g" "$EC_JOB/index-copy.conf"
+  if [ $? != 0 ]; then
+    echo "Failed to update job configuration file: '$EC_JOB/index-copy.conf'"
+    exit 5
+  fi
+}
+
+set_prune_param() {
+  local VAR=$1
+  local VAL=$2
+  sed -i "s/^$VAR=.*/$VAR=$VAL/g" "$EC_JOB/index-prune.conf"
+  if [ $? != 0 ]; then
+    echo "Failed to update job configuration file: '$EC_JOB/index-prune.conf'"
+    exit 5
+  fi
+}
+
+index_list() {
+  curl -Ss "$ES_HOST:$ES_PORT/_status" | jq -r '.indices|keys[]' |\
+  awk -v ESI="$ES_INDEX" '{if ($0 == ESI) print ESI" (default)"; else print $0}'
+}
+
+index_new() {
+  echo "create index: $ES_INDEX"
+  curl -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX?pretty" -d '{
+    "settings" : {
+        "number_of_shards" : 5,
+        "number_of_replicas" : 1,
+        "refresh_interval" : "60s"
+    }
+  }'
+
+  ES_TYPE=page # _id = SHA1(url)
+
+  echo "create mapping: $ES_INDEX/$ES_TYPE"
+  curl -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/$ES_TYPE/_mapping?pretty" -d '{
+      "properties" : {
+        "title" : {
+          "type" : "string"
+        },
+        "body" : {
+          "type" : "string" 
+        },
+        "url" : {
+          "type" : "string" 
+        },
+        "rank" : {
+          "type" : "float"
+        }
+      }
+  }'
+
+  ES_TYPE=node # _id = SHA1(url)
+
+  echo "create mapping: $ES_INDEX/$ES_TYPE"
+  curl -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/$ES_TYPE/_mapping?pretty" -d '{
+      "_timestamp" : { "enabled" : true, "store" : true },
+      "_all": { "enabled": false },
+      "properties" : {
+        "url" : {
+          "type" : "string", 
+          "index" : "no" 
+        },
+        "tag" : {
+          "type" : "string", 
+          "index" : "not_analyzed"
+        },
+        "olinks" : {
+          "type" : "string", 
+          "index" : "no" 
+        },
+        "status" : {
+          "type" : "integer",
+          "index" : "not_analyzed"
+        }
+      }
+  }'
+
+  #
+  # Ranking is calculated using PageRank algorithm.
+  #
+  # rank - ranking value calclated as (1 - D + D * prob)
+  # prob - sum of all probabilities form linking pages (sum(i) rank(i)/L(i))
+  #
+  # D - dumping factor
+  # L - number of outlinks on page
+  #
+
+  ES_TYPE=rank # _id = SHA1(url)
+
+  echo "create mapping: $ES_INDEX/$ES_TYPE"
+  curl -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/$ES_TYPE/_mapping?pretty" -d '{
+      "_all": { "enabled": false },
+      "properties" : {
+        "rank" : {
+          "type" : "float"
+        },
+        "prob" : {
+          "type" : "float"
+        }
+      }
+  }'
+
+  ES_TYPE=host # _id = SHA1(url)
+
+  echo "create mapping: $ES_INDEX/$ES_TYPE"
+  curl -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/$ES_TYPE/_mapping?pretty" -d '{
+      "_all": { "enabled": false },
+      "_ttl" : { "enabled" : true, "default" : "1d" },
+      "_timestamp" : { "enabled" : true, "store" : true },
+      "properties" : {
+        "url" : {
+          "type" : "string", 
+          "index" : "no" 
+        },
+        "robots" : {
+          "type" : "string", 
+          "index" : "no"
+        }
+      }
+  }'
+}
+
+index_mapping() {
+  curl -Ss -XGET "$ES_HOST:$ES_PORT/$ES_INDEX" | jq .
+}
+
+index_copy() {
+  # define job folder
+  EC_JOB="$EC_HOME/job/index-copy"
+  
+  # update job conf
+  set_copy_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+
+  # start copy job on Shellcloud cluster
+  shc start -s ec-index-copy "$EC_JOB" index-copy "$ES_INDEX" "$TARGET_INDEX"
+}
+
+index_delete() {
+  curl -Ss -XDELETE "$ES_HOST:$ES_PORT/$ES_INDEX" | jq -r .
+}
+
+index_health() {
+  curl -Ss "$ES_HOST:$ES_PORT/_cluster/health/$ES_INDEX" | jq -r .
+}
+
+index_optimize() {
+  local OPTIONS="_optimize?only_expunge_deletes=true"
+  curl -Ss "$ES_HOST:$ES_PORT/$ES_INDEX/$OPTIONS" | jq -r .
+}
+
+# escape quotes in string
+escape_quotes() {
+  echo $@ | sed "s/'/\\\'/g"
+}
+
+# JSON-escape QUERY
+escape_json() {
+local QUERY="$(escape_quotes $QUERY)"
+python -c "
+import json
+print json.JSONEncoder().encode('$QUERY')
+"
+}
+
+index_search_by_field() {
+  # escape the query
+  local QUERY="$(escape_json)"
+
+  # query the index
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/page/_search"
+  curl -sS -XGET "$REQUEST" -d @- <<EOF | jq .
+  {
+    "query": {
+      "function_score": {
+        "query" : {
+          "multi_match" : {
+            "query" : $QUERY,
+            "fields" : ["title^3", "body^2", "url"]
+          }
+        },
+        "field_value_factor": {
+          "field": "rank",
+          "missing": 1
+        },
+        "boost_mode": "multiply"
+      }
+    },
+    "fields" : ["url"],
+    "highlight" : {
+      "fields" : {
+        "title" : {
+          "fragment_size" : 100,
+          "number_of_fragments" : 1,
+          "no_match_size": 100
+        },
+        "body" : {
+          "fragment_size" : 100,
+          "number_of_fragments" : 3,
+          "no_match_size": 100
+        }
+      }
+    }
+  }
+EOF
+}
+
+index_search_by_script() {
+  # escape the query
+  local QUERY="$(escape_json)"
+
+  # query the index
+  REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/page/_search"
+  curl -sS -XGET "$REQUEST" -d @- <<EOF | jq .
+  {
+    "query": {
+      "function_score": {
+        "query" : {
+          "multi_match" : {
+            "query" : $QUERY,
+            "fields" : ["title^3", "body^2", "url"]
+          }
+        },
+        "script_score": {
+          "script": "ec_page_rank"
+        },
+        "boost_mode": "multiply"
+      }
+    },
+    "fields" : ["url"],
+    "highlight" : {
+      "fields" : {
+        "title" : {
+          "fragment_size" : 100,
+          "number_of_fragments" : 1,
+          "no_match_size": 100
+        },
+        "body" : {
+          "fragment_size" : 100,
+          "number_of_fragments" : 3,
+          "no_match_size": 100
+        }
+      }
+    }
+  }
+EOF
+}
+
+index_search() {
+  index_search_by_script
+}
+
+index_prune() {
+  # define job folder
+  EC_JOB="$EC_HOME/job/index-prune"
+
+  # update job conf
+  set_prune_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+
+  # start prune job on Shellcloud cluster
+  shc start -s ec-index-prune "$EC_JOB" index-prune "$PERCENT"
+}
+
+index_shards() {
+curl -sS "$ES_HOST:$ES_PORT/$ES_INDEX/_search_shards" | python -c "
+import sys, json
+sys.path.append('$EC_LIB')
+import elasticsearch as es
+nodes = es.ElasticShards(sys.stdin)
+for i in range(nodes.get_shard_count()):
+  index = nodes.get_shard_index(i)
+  if index == '$ES_INDEX':
+    print '%d %s %s' % (i, nodes.get_shard_node(i), nodes.get_shard_ip(i))
+"
+}
+
+index_refresh() {
+  if [ "$RATE" = 0 ]; then
+    curl -sS "$ES_HOST:$ES_PORT/$ES_INDEX/_refresh" | jq .
+  else
+    curl -sS -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/_settings" -d @- <<EOF | jq .
+    {
+      "index" : {
+        "refresh_interval" : "$RATE"
+      }
+    }
+EOF
+  fi
+}
+
+index_replicas() {
+  curl -sS -XPUT "$ES_HOST:$ES_PORT/$ES_INDEX/_settings" -d @- <<EOF | jq .
+  {
+    "index" : {
+      "number_of_replicas" : "$NUMREPS"
+    }
+  }
+EOF
+}
+
+index_$ACTION

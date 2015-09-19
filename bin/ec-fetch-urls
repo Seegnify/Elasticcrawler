@@ -1,0 +1,380 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+EC_CONF="$EC_HOME/conf"
+CONFIG="$EC_CONF/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+STATUS="$EC_HOME/conf/statuscodes.conf"  
+if [ -f "$STATUS" ]; then
+  . "$STATUS"
+else
+  echo "Missing status codes: '$STATUS'"
+  exit 2
+fi
+
+# validate input arguments
+if [ $# -lt 1 ]; then
+  echo "Syntax: $0 <FILE> | -
+
+Options:
+
+  FILE - file to read the urls from (one url per line).
+  '-'  - read urls from standard input (one url per line)."
+  exit 3
+fi
+
+# assign input arguments
+if [ "$1" = "-" ]; then
+  INPUT="/dev/stdin"
+else
+  INPUT=$1
+fi
+
+# add EC lib to python modules
+export PYTHONPATH="$EC_LIB"
+
+# create temp files
+WORKDIR=$(mktemp -d --tmpdir ec-XXXXXXXX)
+if [ ! -d "$WORKDIR" ]; then
+  exit 4
+fi
+ROBOTS="$WORKDIR/robots"
+PARSED="$WORKDIR/parsed"
+SUBJECT="$WORKDIR/subject"
+RESULTS="$WORKDIR/results"
+FETCHED="$WORKDIR/fetched"
+HEADERS="$WORKDIR/headers"
+OUTLINKS="$WORKDIR/outlinks"
+ESNODES="$WORKDIR/esnodes"
+
+# set auto-cleanup routine
+trap onsignal HUP INT TERM
+
+# trap routine
+onsignal() {
+  cleanup
+  exit 100
+}
+
+# cleanup routine
+cleanup() {
+  rm -rf $WORKDIR
+}
+
+# escape quotes in string
+escape_quotes() {
+  echo $@ | sed "s/'/\\\'/g"
+}
+
+# get robots url
+get_robots_url() {
+local URL="$(escape_quotes $URL)"
+python -c "
+import elasticcrawler as ec
+print ec.get_robots_url('$URL')
+"
+}
+
+# get network location id
+get_netloc_id() {
+local URL="$(escape_quotes $URL)"
+python -c "
+import elasticcrawler as ec
+print ec.get_netloc_id('$URL')
+"
+}
+
+# get HTTP response code
+get_response_code() {
+python -c "
+import elasticcrawler as ec
+print ec.get_response_code('$HEADERS')
+"
+}
+
+# get HTTP header value
+get_header_value() {
+local HEADER="$1"
+python -c "
+import elasticcrawler as ec
+print ec.get_header_value('$HEADERS', '$HEADER')
+"
+}
+
+# delay routine
+delay_host_fetch() {
+  local start=$HOST_ACCESS_TIME
+  local stop=$(date +%s)
+  local max=$HOST_ACCESS_DELAY
+  local reminder=$(( (stop-start)<max ? (max-(stop-start)):0 ))
+  if [ $reminder -gt 0 ]; then
+    echo "Waiting: $URL (${reminder})"
+    sleep $reminder
+  fi
+}
+
+# set robots in ES cache
+set_host_robots_cache() {
+local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/host/$HOST_ID"
+python -c "
+import elasticcrawler as ec
+print ec.get_robots_create_request('$ROBOTS','$ROBOTS_URL')" > "$RESULTS"
+if [ $? = 0 ]; then
+  curl -sS -XPUT "$REQUEST" -d "@$RESULTS"
+else
+  > "$ROBOTS"
+fi
+}
+
+# get robots from ES cache
+get_host_robots_cache() {
+# set default host access time to 1970-01-01 00:00:00 UTC
+HOST_ACCESS_TIME=0
+
+local FIELDS="robots,_timestamp"
+local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/host/$HOST_ID?fields=$FIELDS"
+curl -sS -D "$HEADERS" "$REQUEST" -o "$RESULTS"
+if [ $? != 0 ]; then
+  return $?
+elif [ $(get_response_code) != 200 ]; then
+  return 1
+fi
+
+# set access time in seconds
+HOST_ACCESS_TIME=$(cat "$RESULTS" | jq '.fields._timestamp')
+HOST_ACCESS_TIME=$((HOST_ACCESS_TIME / 1000))
+
+# extract robots from ES response
+cat "$RESULTS" | jq -r -e '.fields.robots[0]' > "$ROBOTS"
+if [ $? != 0 ]; then
+  rm "$ROBOTS"
+  return 2
+fi
+}
+
+# update search index
+update_search_index() {
+local URL="$(escape_quotes $URL)"
+local REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/_bulk?pretty"
+python -c "
+import elasticcrawler as ec
+print ec.get_index_update_request('$URL', '$CRAWL_STATUS',
+['$STATUS_HTTP_SUCCESS'], '$SUBJECT', '$PARSED', '$OUTLINKS')
+" | curl -sS -XPOST "$REQUEST" --data-binary @-
+}
+
+# update search index and log status
+update_search_index_with_status() {
+
+# update index
+update_search_index > "$RESULTS"; RET=$?
+if [ $RET != 0 ]; then
+  echo "Indexing: $URL ($RET)"
+  return $RET
+fi
+
+# get reponse code
+ESERR=$(cat "$RESULTS" | jq '.errors'); RET=$?
+if [ $RET != 0 ]; then
+  echo "Indexing: $URL ($RET)" # jq errors
+elif [ $ESERR = 'true' ]; then
+  RET=$(cat "$RESULTS" | jq '.items[].index.status' | grep -v -E ^2 | head -n 1)
+  echo "Indexing: $URL ($RET)" # ES doc error
+elif [ $ESERR != 'false' ]; then
+  RET=$(cat "$RESULTS" | jq '.status')
+  echo "Indexing: $URL ($RET)" # ES error
+else
+  echo "Indexing: $URL OK"
+fi
+
+# make sure to return number
+echo "$RET" | egrep '^[0-9]+$' > /dev/null 2>&1
+if [ $? != 0 ]; then
+  return 1
+else
+  return $RET
+fi
+}
+
+# is host access allowed
+is_client_access_allowed() {
+local URL="$(escape_quotes $URL)"
+python -c "
+import elasticcrawler as ec, sys
+allowed = ec.is_client_access_allowed('$URL', '$CONFIG',
+'$EC_CONF/allowed.hosts', '$EC_CONF/excluded.hosts')
+sys.exit(0 if allowed else 1)
+"
+}
+
+# is robot access allowed
+is_robot_access_allowed() {
+local URL="$(escape_quotes $URL)"
+python -c "
+import elasticcrawler as ec
+ec.is_robot_access_allowed('$URL', '$ROBOTS', '$HTTP_USER_AGENT')
+"
+}
+
+# extract links and title
+extract_links_and_title() {
+local URL="$(escape_quotes $URL)"
+timeout -k 10 $MAX_PARSE_TIME \
+python -c "
+import elasticcrawler as ec
+ec.extract_links_and_title('$URL', '$FETCHED', 
+'$ALLOWED_PROTOCOLS', '$EXCLUDE_FILE_TYPES', '$OUTLINKS', '$SUBJECT')
+"
+}
+
+# start extension server
+"$EC_BIN/ec-server" start
+if [ $? != 0 ]; then
+  exit
+fi
+
+# get index nodes
+"$EC_BIN/ec-index" -s "$ES_INDEX" | awk '{print $3}' | sort -u > "$ESNODES"
+
+# read urls from file or stdin
+while read URL
+do
+  # report current URL
+  echo "Processing: $URL"
+
+  # get random host for the index
+  ES_HOST=$(shuf "$ESNODES" | head -n 1)
+
+  # reset variables
+  CRAWL_STATUS=$STATUS_UNKNONW
+
+  # check if the host access is allowed
+  is_client_access_allowed > /dev/null
+  if [ $? != 0 ]; then
+    CRAWL_STATUS=$STATUS_CLIENT_REJECTED
+    echo "Excluded: $URL ($CRAWL_STATUS)"
+    update_search_index_with_status
+    continue
+  fi
+
+  ROBOTS_URL=$(get_robots_url)
+  HOST_ID=$(get_netloc_id)
+
+  # get robots.txt from ES cache
+  get_host_robots_cache > /dev/null
+  if [ $? != 0 ] || [ ! -f "$ROBOTS" ]; then
+    # update host robots cache
+    echo "Caching robots: $ROBOTS_URL @ $HOST_ID"
+
+    # get robots from remote host
+    curl -sS -L -A "$HTTP_USER_AGENT" --proto "=$ALLOWED_PROTOCOLS" \
+    -m "$MAX_FETCH_TIME" -D "$HEADERS" -o $ROBOTS "$ROBOTS_URL"
+    if [ $? != 0 ] || [ $(get_response_code) != 200 ]; then
+      > $ROBOTS
+    fi
+
+    # store robots in ES cache
+    set_host_robots_cache > /dev/null
+  fi
+
+  # check if the url access is allowed
+  is_robot_access_allowed > /dev/null
+  if [ $? != 0 ]; then
+    CRAWL_STATUS=$STATUS_SERVER_REJECTED
+    echo "Excluded: $URL ($CRAWL_STATUS)"
+    update_search_index_with_status
+    continue
+  fi
+
+  # based on host access time (HOST_ACCESS_TIME), 
+  # wait long enough before the host is accessed
+  delay_host_fetch
+
+  # fetch content
+  curl -sS -L -A "$HTTP_USER_AGENT" --proto "=$ALLOWED_PROTOCOLS" \
+  -m "$MAX_FETCH_TIME" --max-filesize "$MAX_FETCH_SIZE" -D "$HEADERS" \
+  -o "$FETCHED" "$URL"; RET=$?
+  if [ $RET != 0 ]; then
+    if [ $RET = 28 ]; then
+      CRAWL_STATUS=$STATUS_FETCH_TIMEOUT
+    else
+      CRAWL_STATUS=$STATUS_FETCH_FAILURE
+    fi
+    echo "Fetching: $URL ($CRAWL_STATUS)"
+    update_search_index_with_status
+    continue
+  fi
+
+  # get fetch reponse code
+  CRAWL_STATUS=$(get_response_code); RET=$?
+  if [ $RET != 0 ]; then
+    CRAWL_STATUS=$STATUS_INVALID_RESPONSE
+    echo "Fetching: $URL ($RET)"
+    update_search_index_with_status
+    continue
+  elif [ $CRAWL_STATUS != $STATUS_HTTP_SUCCESS ]; then
+    echo "Fetching: $URL ($CRAWL_STATUS)"
+    update_search_index_with_status
+    continue
+  fi
+  echo "Fetching: $URL OK"
+
+  # extract content (tika returns content with title)
+  cat "$FETCHED" | timeout -k 10 $MAX_PARSE_TIME \
+  nc localhost $TIKA_PARSER_PORT > "$PARSED"; RET=$?
+  if [ $RET != 0 ]; then
+    if [ $RET = 124 ] || [ $RET = 137 ]; then
+      CRAWL_STATUS=$STATUS_PARSE_TIMEOUT
+    else
+      CRAWL_STATUS=$STATUS_PARSE_FAILURE
+    fi
+    echo "Parsing: $URL ($RET)"
+    update_search_index_with_status
+    continue
+  fi
+  echo "Parsing: $URL OK"
+
+  # extract links and title (to subtract from content)
+  extract_links_and_title > /dev/null; 
+  RET=$?
+  if [ $RET != 0 ]; then
+    if [ $RET = 124 ] || [ $RET = 137 ]; then
+      CRAWL_STATUS=$STATUS_PARSE_TIMEOUT
+    else
+      CRAWL_STATUS=$STATUS_PARSE_FAILURE
+    fi
+    > "$OUTLINKS"
+    > "$SUBJECT"
+    echo "Outlinks: $URL ($RET)"
+  else
+    echo "Outlinks: $URL OK"
+  fi
+
+  # update search index
+  update_search_index_with_status
+  if [ $? != 0 ]; then
+    continue
+  fi
+
+  # seeding new url nodes
+  $EC_BIN/ec-create-urls "$OUTLINKS" "$ES_HOST" > /dev/null
+  RET=$?
+  if [ $RET != 0 ]; then
+    echo "Seeding: $URL ($RET)"
+  else
+    echo "Seeding: $URL OK"
+  fi
+
+done < "$INPUT"
+
+# do cleanup
+cleanup
+

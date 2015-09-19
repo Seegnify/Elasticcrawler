@@ -1,0 +1,26 @@
+#!/bin/sh
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# stop server
+"$EC_BIN/ec-server-stop"
+
+# empty RSH allowed hosts
+echo -n > $HOME/.rhosts

@@ -1,0 +1,151 @@
+#!/bin/sh
+
+SCRIPT=$(basename $0)
+SCRIPT_OPTIONS=$@
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# load job settings
+CONFIG="$PWD/$SCRIPT.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 3
+fi
+
+# validate input arguments
+if [ $# != 2 ]; then
+cat << EOF
+Syntax: $SCRIPT <TARGET_INDEX>
+
+  Copy documents given by SCROLL_ID from current index to targe index .
+  Initial SCROLL_ID is defined in the job configuraion file.
+
+Options:
+
+  SOURCE_INDEX - Source index to copy from.
+  TARGET_INDEX - Destination index to copy to.
+EOF
+  exit 4
+fi
+
+# get input params
+SOURCE_INDEX=$1
+TARGET_INDEX=$2
+
+# set scroll options
+SCROLL_SIZE=$BULK_SIZE
+SCROLL_TIME=10m
+
+# setup logging
+if [ ! -d "$LOGS_DIRECTORY" ]; then
+  echo "Logs directory '$LOGS_DIRECTORY' is missing" >&2
+  exit 5
+fi
+EC_LOG="$LOGS_DIRECTORY/$SCRIPT-$JOB_DATE_TIME-$PPID.log"
+date >> "$EC_LOG"
+if [ $? != 0 ]; then
+  echo "Unable to access log file: '$EC_LOG'" >&2
+  exit 6
+fi
+
+# log start
+echo "Logging to $EC_LOG"
+echo "Host name/address: $SHC_HOST" >> "$EC_LOG"
+echo "Starting: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+
+# get initial scroll id over *all* documents or *type* documents
+OPTIONS="search_type=scan&scroll=$SCROLL_TIME&size=$SCROLL_SIZE"
+REQUEST="$ES_HOST:$ES_PORT/$SOURCE_INDEX/$SOURCE_TYPE/_search?$OPTIONS"
+SCROLL_ID=$(curl -sS -XGET "$REQUEST" -d @- <<EOF 2> /dev/null |\
+jq -e -r '._scroll_id')
+{
+  "query" : {
+    "match_all" : {}
+  }
+}
+EOF
+
+# validate scroll results
+if [ $? != 0 ] || [ -z "$SCROLL_ID" ]; then
+  echo "Failed to initiate scan and scroll." >> "$EC_LOG"
+  exit 7
+fi
+
+# get index nodes
+"$EC_BIN/ec-index" -s "$ES_INDEX" | awk '{print $3}' | sort -u > source.nodes
+if [ -z "$TARGET_HOST" ]; then
+"$EC_BIN/ec-index" -s "$TARGET_INDEX" | awk '{print $3}' | sort -u > target.nodes
+fi
+
+# count indexed docs
+INDEXED_DOCS=0
+
+# scroll through source docs and add them to destination
+while [ 1 ]
+do
+  # get random host for source index
+  ES_HOST=$(shuf source.nodes | head -n 1)
+
+  # get current docs and and increment ID
+  OPTIONS="scroll=$SCROLL_TIME&scroll_id=$SCROLL_ID"
+  REQUEST="$ES_HOST:$ES_PORT/_search/scroll?$OPTIONS"
+  curl -sS -XGET "$REQUEST" > response
+  SCROLL_ID=$(jq -e -r '._scroll_id' response)
+
+  # if all docs have been fetched, stop fetching
+  CURRENT_DOCS=$(jq -c -e -r '.hits.hits[]._id' response | wc -l)
+  if [ $CURRENT_DOCS = 0 ]; then
+    break
+  fi
+
+  # prepare bulk of docs for target index
+  BULK_FILTER='.hits.hits[] | {index:{_type:._type, _id:._id}}, ._source'
+  jq -c -e -r "$BULK_FILTER" response > bulk
+
+  # get target host for bulk copy
+  if [ -z "$TARGET_HOST" ]; then
+    ES_HOST=$(shuf target.nodes | head -n 1)
+  else
+    ES_HOST=$TARGET_HOST
+  fi
+
+  # bulk-index the docs on target index
+  REQUEST="$ES_HOST:$ES_PORT/$TARGET_INDEX/_bulk"
+  curl -sS -XPOST "$REQUEST" --data-binary @bulk > response; RET=$?
+  if [ $RET != 0 ]; then
+    echo "Failed to index bulk of documents."
+    echo response
+    continue
+  fi
+
+  # update indexed docs count
+  INDEXED_DOCS=$((INDEXED_DOCS+CURRENT_DOCS))
+
+done >> "$EC_LOG" 2>&1
+
+# report number of indexed docs
+echo "Indexed: $INDEXED_DOCS documents" >> "$EC_LOG"
+
+# log stop
+echo "Stopping: $SCRIPT" >>
+"$EC_LOG"
+

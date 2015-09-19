@@ -1,0 +1,175 @@
+#!/bin/sh
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+# show script syntax
+syntax() {
+  echo "Syntax: $0 {-a|-n|-o <AGE>} [-h <HOST>] [-s <SHARD>] [-t <TAG>]
+  
+  Count urls by age, shard, node or tag.
+
+Options:
+
+  -a       - Count any urls in ES index.
+  -n       - Count new urls that have not been crawled yet.
+  -o AGE   - Count old urls crawled AGE ago, where AGE is ES age (1s, 2m, ect.).
+  -h HOST  - Restrict the count to a host, where HOST is ES node id.
+  -s SHARD - Restrict the count to a shard, where SHARD is ES shard id.
+  -t TAG   - Filter the urls by tag where TAG is the tag name."
+}
+
+# read input params
+while getopts ano:h:s:t: opt
+do
+  case $opt in
+    a)  STRATEGY=any;;
+    n)  STRATEGY=new;;
+    o)  STRATEGY=old; AGE=$OPTARG;;
+    h)  if [ "$PREF" != "" ]; then
+          PREF="$PREF;"
+        fi
+        PREF=${PREF}_only_node:$OPTARG;;
+    s)  if [ "$PREF" != "" ]; then
+          PREF="$PREF;"
+        fi
+        PREF=${PREF}_shards:$OPTARG;;
+    t)  TAG=$OPTARG;;
+  esac
+done
+
+# create error log
+ERRLOG=$(mktemp)
+if [ ! -f $ERRLOG ]; then
+  exit 3
+fi
+
+# define json output format
+FORMAT='.count'
+REQUEST="$ES_HOST:$ES_PORT/$ES_INDEX/node/_count?preference=$PREF&pretty"
+
+count_any() {
+if [ -z "$TAG" ]; then
+  # count all urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "match_all" : {}
+    }
+  }
+EOF
+else
+  # count all tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "term" : { "tag" : "$TAG" }
+    }
+  } 
+EOF
+fi
+}
+
+count_new() {
+if [ -z "$TAG" ]; then
+  # count all new urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "filter" : {
+          "missing" : { "field" : "status" }
+        }
+      }
+    }
+  }
+EOF
+else
+  # count all new tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "query" : {
+          "term" : { "tag" : "$TAG" }
+        },
+        "filter" : {
+          "missing" : { "field" : "status" }
+        }
+      }
+    }
+  }
+EOF
+fi
+}
+
+count_old() {
+if [ -z "$TAG" ]; then
+  # count all due urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "filter" : {
+          "and" : [
+            { "exists" : { "field" : "status" } },
+            { "range" : { "_timestamp" : { "lt" : "now-$AGE" } } }
+          ]
+        }
+      }
+    }
+  }
+EOF
+else
+  # count all due tagged urls
+  curl -sS -XPOST "$REQUEST" -d @- <<EOF 2> $ERRLOG | jq -r $FORMAT 2>> $ERRLOG
+  {
+    "query" : {
+      "filtered" : {
+        "query" : { 
+          "term" : { "tag" : "$TAG" } 
+        },
+        "filter" : {
+          "and" : [
+            { "exists" : { "field" : "status" } },
+            { "range" : { "_timestamp" : { "lt" : "now-$AGE" } } }
+          ]
+        }
+      }
+    }
+  }
+EOF
+fi
+}
+
+# count according to strategy
+case $STRATEGY in
+  any) count_any;;
+  new) count_new;;
+  old)
+    if [ -z "$AGE" ]; then
+      syntax
+      exit 3
+    fi
+    count_old
+    ;;
+  *)  
+    syntax
+    exit 4
+    ;;
+esac
+
+# print error log and return log size
+cat $ERRLOG 1>&2
+RET=$(stat -c '%s' $ERRLOG)
+rm $ERRLOG
+exit $RET

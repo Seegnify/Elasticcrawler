@@ -1,0 +1,34 @@
+EC Performance
+--------------
+
+To minimize host availability wait time during fetching, make sure that system
+clock is synchronized on EC and ES nodes. Failure to synchronize the time will
+result in increased or decreased default wait time set via HOST_ACCESS_DELAY.
+For this reason it is recommended to use NTP on all EC and ES nodes.
+
+ES Performance
+--------------
+
+In order for aggregations (or any operation that requires access to field values) to be fast, access to fielddata must be fast. To configure Elasticsearch fielddata, you need to properly set ES_HEAP_SIZE, indices.fielddata.cache.size and indices.breaker.fielddata.limit. You can olso consider changing related settings indices.breaker.request.limit and/or indices.breaker.total.limit.
+
+The indices.fielddata.cache.size controls how much heap space is allocated to fielddata. By default, this setting is unbounded—Elasticsearch will never evict data from fielddata. Try setting indices.fielddata.cache.size to 75%. The fielddata circuit breaker limits the size of fielddata to 60% of the heap, by default. Try setting indices.breaker.fielddata.limit to 85%.
+
+The relationship between indices.fielddata.cache.size and indices.breaker.fielddata.limit is an important one. If the circuit-breaker limit is lower than the cache size, no data will ever be evicted. In order for it to work properly, the circuit breaker limit must be higher than the cache size.
+
+Disk IO during heavy indexing or merging can significantly affect search times. To mitigate this impact disk IO can be throttled by changing the following settings on the cluster:
+
+curl -XPUT $ES_HOST/_cluster/settings @- <<EOF
+{
+  "transient" : {
+    "indices.store.throttle.type" : "all"
+  }
+}
+EOF
+
+curl -XPUT $ES_HOST/_cluster/settings @- <<EOF
+{
+  "transient" : {
+    "indices.store.throttle.max_bytes_per_sec" : "20mb"
+  }
+}
+EOF

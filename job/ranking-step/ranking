@@ -1,0 +1,145 @@
+#!/bin/sh
+#
+# PageRank step
+#
+
+SCRIPT=$(basename $0)
+SCRIPT_OPTIONS=$@
+
+# find crawler
+EC_FETCH=$(which ec-fetch-urls)
+if [ ! -f "$EC_FETCH" ]; then
+  echo "Elasticcrawler not found on PATH"
+  exit 1
+fi
+
+# load local settings
+EC_BIN=$(dirname "$EC_FETCH")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 2
+fi
+
+# load job settings
+CONFIG="$PWD/$SCRIPT.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 3
+fi
+
+# validate input arguments
+if [ $# != 2 ]; then
+cat << EOF
+Syntax: $SCRIPT <ALG_STEP> <SET_SIZE>
+
+  PageRank job to execute on URL set defined by ES scroll ID in scroll.id file.
+
+Options:
+
+  ALG_STEP - PageRank step to execute.
+  SET_SIZE - Size of url set to process.
+EOF
+  exit 4
+fi
+
+# get input params
+ALG_STEP=$1
+SET_SIZE=$2
+
+# cleanup on singal
+trap onsignal HUP INT TERM
+
+# signal handler
+onsignal() {
+  cleanup
+  exit 10
+}
+
+# cleanup routine
+cleanup() {
+  rm -rf $TMPDIR
+}
+
+# setup work folder
+TMPDIR=$(mktemp -d --tmpdir ec-XXXXXXXX)
+if [ ! -d "$TMPDIR" ]; then
+  exit 8
+fi
+
+# setup logging
+if [ ! -d "$LOGS_DIRECTORY" ]; then
+  echo "Logs directory '$LOGS_DIRECTORY' is missing" >&2
+  exit 5
+fi
+EC_LOG="$LOGS_DIRECTORY/$SCRIPT-$JOB_DATE_TIME-$PPID.log"
+date >> "$EC_LOG"
+if [ $? != 0 ]; then
+  echo "Unable to access log file: '$EC_LOG'" >&2
+  exit 6
+fi
+
+# log start
+echo "Starting: $SCRIPT $SCRIPT_OPTIONS" >> "$EC_LOG"
+echo "Host name/address: $SHC_HOST" >> "$EC_LOG"
+
+# define default BULK_SIZE
+if [ -z "$BULK_SIZE" ]; then
+  BULK_SIZE=1000
+fi
+echo "Bulk size: $BULK_SIZE docs" >> "$EC_LOG"
+
+# get scroll id from file
+ES_SCROLL="$PWD/scroll.id"
+
+# define scroll filter
+SCROLL_FMT='.hits.hits[] | @text "\(._id)\t\(.fields.url[0])"'
+
+# clear urls file
+rm -f urls > /dev/null 2>&1
+
+# collect the url set by scrolling
+while [ 1 ]
+do
+  # scroll urls, output _id and url
+  "$EC_BIN/ec-list-urls" -i "$ES_SCROLL" -f "$SCROLL_FMT" > scroll; RET=$?
+  if [ $RET != 0 ]; then
+    echo "Failed to list urls at scroll ID:" $(cat "$ES_SCROLL") "($RET)"
+    exit 9
+  fi
+
+  cat scroll >> "$TMPDIR/urls"
+  SCROLL_URLS=$(cat scroll | wc -l)
+  FETCHED_URLS=$((FETCHED_URLS+SCROLL_URLS))
+
+  # if all urls have been fetched, stop fetching
+  if [ $SCROLL_URLS = 0 ]; then
+    break
+  fi
+
+  # if count of fetched urls is > SET_SIZE, create another set elsewhere
+  if [ $FETCHED_URLS -ge $SET_SIZE ]; then
+    shc start -r ec-ranking-step "$PWD" "$SCRIPT" $ALG_STEP $SET_SIZE
+    break
+  fi
+done >> "$EC_LOG" 2>&1
+
+# report number of fetched urls
+echo "Retrieved $FETCHED_URLS urls" >> "$EC_LOG"
+
+# process the url set
+python ranking.py "$EC_HOME" $ALG_STEP $BULK_SIZE < "$TMPDIR/urls" >> "$EC_LOG" 2>&1
+
+# cleanup work dir
+cleanup >> "$EC_LOG" 2>&1
+
+# log stop
+echo "Stopping: $SCRIPT $SCRIPT_OPTIONS ($?)" >> "$EC_LOG"
+date >> "$EC_LOG"
+

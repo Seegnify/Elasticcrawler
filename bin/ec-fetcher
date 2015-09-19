@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# EC fetcher
+#
+
+# load settings
+EC_BIN=$(dirname "$0")
+EC_HOME=$(dirname "$EC_BIN")
+EC_LIB="$EC_HOME/lib"
+EC_JOB="$EC_HOME/job/fetcher"
+CONFIG="$EC_HOME/conf/elasticcrawler.conf"
+if [ -f "$CONFIG" ]; then
+  . "$CONFIG"
+else
+  echo "Missing settings file: '$CONFIG'"
+  exit 1
+fi
+
+SCRIPT=$(basename $0)
+
+# show script syntax
+syntax() {
+cat <<EOF
+Syntax: $SCRIPT {-a|-n|-o <AGE>} [-t <TAG>]
+
+  Fetch a selection of urls.
+
+Options:
+
+  -a        - Select all urls in ES index.
+  -n        - Select new urls that have not been crawled yet.
+  -o AGE    - Select old urls crawled AGE ago, where AGE is ES age (1s,2m,ect.).
+  -t TAG    - Limit selected urls to those with tag set to TAG.
+  
+EOF
+}
+
+# read options
+while getopts ano:t: opt
+do
+  case $opt in
+    a)  STRATEGY="-a";;
+    n)  STRATEGY="-n";;
+    o)  STRATEGY="-o $OPTARG";;
+    t)  TAG="-t $OPTARG";;
+    *)  syntax
+        exit 3
+        ;;
+  esac
+done
+
+# validate input arguments
+if [ -z "$STRATEGY" ]; then
+  syntax
+  exit 2
+fi
+
+set_fetcher_param() {
+local VAR=$1
+local VAL=$2
+sed -i "s/^$VAR=.*/$VAR=$VAL/g" "$EC_JOB/fetcher.conf"
+if [ $? != 0 ]; then
+  echo "Failed to update job configuration file: '$EC_JOB/fetcher.conf'"
+  exit 4
+fi
+}
+
+run_fetcher() {
+  # count urls
+  URL_COUNT=$("$EC_BIN/ec-count-urls" $STRATEGY $TAG)
+
+  # get urls per job
+  URLS_PER_JOB=$((URL_COUNT / MAX_JOB_COUNT))
+  URLS_MOD_JOB=$((URL_COUNT % MAX_JOB_COUNT))
+  if [ $URLS_MOD_JOB -gt 0 ]; then
+    URLS_PER_JOB=$((URLS_PER_JOB+URLS_MOD_JOB))
+    URLS_MOD_JOB=0
+  fi
+
+  # run map jobs in parallel on each shard separatelly via SHC
+  "$EC_BIN/ec-index" -s "$ES_INDEX" | while read SHARD NODE IP
+  do
+    # update job conf
+    set_fetcher_param JOB_DATE_TIME $(date +'%Y-%m-%dT%H:%M:%S%z')
+
+    # reset scroll id
+    rm -f "$EC_JOB/scroll.id" > /dev/null 2>&1
+
+    # get initial scroll id
+    "$EC_BIN/ec-list-urls" -s $SHARD -i "$EC_JOB/scroll.id" $STRATEGY $TAG
+
+    # start jobs on Shellcloud cluster
+    shc start -s ec-fetcher "$EC_JOB" fetcher $URLS_PER_JOB
+  done
+}
+
+run_fetcher
