@@ -40,7 +40,7 @@ with arbitrary URLs, fetch and rank the URLs. Each of the following steps
 requires that access to Elasticsearch is already defined (see the Configuration 
 section).
 
-### Create index
+### Creating index
 
 Creating a new index is very easy, just execute the following command.
 
@@ -48,13 +48,13 @@ Creating a new index is very easy, just execute the following command.
 
 To list all existing indexes including the newly created one run `ec-index -l`.
 
-### Seed index
+### Seeding index
 
 Initial URLs can be seeded from a file with each URL listed on separate line.
 
     ec-create-urls urls.txt
 
-### Run fetcher
+### Fetching
 
 Fetching is distributed. Number of fetcher jobs is defined by configuration
 setting MAX_JOB_COUNT. Elasticsearch relies on Shellcloud to distribute the 
@@ -62,10 +62,11 @@ crawler jobs. To start the crawler on new URls run the following command:
 
     ec-fetcher -n
 
-### Run ranking
+### Ranking
 
-Ranking is also distributed. Make sure that some urls have been fetched prior 
-to running ranking. To start the ranking run the following command:
+Ranking also is distributed and it depends on fetching. Make sure that at least 
+some urls have been fetched prior to running ranking. To start the ranking run 
+the following command:
 
     ./bin/ec-ranking -f 2 -o 1m
 
