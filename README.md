@@ -16,7 +16,7 @@ Elasticcrawler does the following things:
 * Seed index with arbitrary URLs
 * Fetch URLs via HTTP and/or HTTPS
 * Parse web pages with Tika or alternative parsers
-* Populate searchable index with parsed content
+* Populate index with parsed content
 * Generate web graph from fetched URLs
 * Rank web pages using PageRank algorithm
 * Tag and filter URLs
