@@ -78,7 +78,7 @@ Installation
 ------------
 
 Installation is as easy as copying the project files to a desired location and 
-adding Elasticcrawler 'bin' folder environment variable PATH.
+adding Elasticcrawler 'bin' folder to the environment variable PATH.
 
 Configuration
 -------------
